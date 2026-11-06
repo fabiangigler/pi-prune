@@ -6,6 +6,8 @@ type SessionSource = ExtensionContext["sessionManager"];
 
 export const PRUNE_ENTRY = "pi-prune";
 
+export class CompactionRequiredError extends Error {}
+
 export interface Selection {
   model: { provider: string; id: string };
   thinkingLevel: string;
@@ -45,7 +47,7 @@ export function planPrune(source: SessionSource): PrunePlan {
   }
   const branch = source.getBranch();
   const latest = branch.findLast((entry) => entry.type === "compaction");
-  if (!latest || latest.type !== "compaction") throw new Error("Run /compact before /prune.");
+  if (!latest || latest.type !== "compaction") throw new CompactionRequiredError("Run /compact before /prune.");
   const firstKept = branch.findIndex((entry) => entry.id === latest.firstKeptEntryId);
   if (firstKept < 0 || firstKept > branch.indexOf(latest)) throw new Error("Invalid compaction boundary.");
 
@@ -107,7 +109,8 @@ export function planPrune(source: SessionSource): PrunePlan {
   };
 }
 
-export function assertUnchanged(source: SessionSource, plan: PrunePlan): void {
+export function assertUnchanged(source: SessionSource,
+  plan: Pick<PrunePlan, "sourceId" | "sourceFile" | "sourceLeaf" | "sourceCount" | "contextHash">): void {
   if (source.getSessionId() !== plan.sourceId || source.getSessionFile() !== plan.sourceFile ||
       source.getLeafId() !== plan.sourceLeaf || source.getEntries().length !== plan.sourceCount ||
       contextHash(source.buildSessionProjection().messages) !== plan.contextHash) {

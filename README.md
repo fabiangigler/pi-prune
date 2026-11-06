@@ -12,15 +12,15 @@ Run `/reload` or restart Pi when you are ready to load the extension.
 
 ## Use
 
-Run `/compact` if needed, then `/prune` while Pi is idle. Confirm to switch to a smaller continuation. **The original session is never rewritten or deleted** and remains available through `/resume`; the new session links back to it.
+Run `/prune` while Pi is idle and confirm. If the current branch has no compaction, Pi first compacts it (a model call that may incur token costs), then automatically prunes after success. Cancellation, failure, or a session too small to compact stops pruning. Already-compacted branches make no model call or new summary.
 
-No model call or additional summary is made. The extension verifies the copied session's stored model context before switching: the existing summary, retained messages, context edits, images, and provider signatures stay intact.
+The extension verifies the copied session's stored model context before switching: the summary, retained messages, context edits, images, and provider signatures stay intact. **The original session is never rewritten or deleted** and remains available through `/resume`; the continuation links back to it. Automatic compaction only appends a summary to the original archive.
 
 Custom entries, system/tool declarations, and messages carrying `details` are conservatively retained, without special-casing any extension. Model/thinking selection and active tools are restored. This can limit size savings. Only the current conversation branch is continued; retained state on other branches stays separate.
 
 Extensions that replay discarded text, reference removed entries, or keep state only in memory may need the original session. Historical navigation and complete usage totals belong to that archive. Startup hooks can change the new session; `/prune` warns if its context or settings differ after switching. It does not guarantee an immediate RSS decrease.
 
-Requires a saved, compacted session and confirmation (TUI or RPC). Tested with Pi 1.4 and 1.5, session format v3. Files stay local; nothing is uploaded.
+Requires a saved session and confirmation (TUI or RPC). Tested with Pi 1.4 and 1.5, session format v3. Pruning is local; automatic compaction uses Pi's configured model/provider.
 
 ## Development
 

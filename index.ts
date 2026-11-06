@@ -1,6 +1,6 @@
 import { unlinkSync } from "node:fs";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { assertUnchanged, contextHash, createPrunedSession, planPrune, PRUNE_ENTRY } from "./prune.ts";
+import { assertUnchanged, CompactionRequiredError, contextHash, createPrunedSession, planPrune, PRUNE_ENTRY, type PrunePlan } from "./prune.ts";
 
 export default function pruneExtension(pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {
@@ -33,19 +33,45 @@ export default function pruneExtension(pi: ExtensionAPI) {
           thinkingLevel: pi.getThinkingLevel(),
           activeTools: pi.getActiveTools(),
         };
-        const plan = planPrune(ctx.sessionManager);
-        const confirmed = await ctx.ui.confirm("Prune session?",
-          `Remove ${plan.removed} historical records from a new continuation, without another summary?\n` +
-          "The original archive stays available through /resume. Custom state and messages with details are kept.\n" +
-          "Extensions that depend on discarded text or in-memory state may need the original session.");
-        if (!confirmed) return;
-        if (!ctx.isIdle() || ctx.hasPendingMessages()) throw new Error("Pi is no longer idle. Please try again.");
-        assertUnchanged(ctx.sessionManager, plan);
-        if (pi.getThinkingLevel() !== selection.thinkingLevel || ctx.model?.id !== selection.model.id ||
-            ctx.model?.provider !== selection.model.provider ||
-            JSON.stringify(pi.getActiveTools()) !== JSON.stringify(selection.activeTools)) {
-          throw new Error("Model or tool settings changed. Please try again.");
+        const assertReady = () => {
+          if (!ctx.isIdle() || ctx.hasPendingMessages()) throw new Error("Pi is no longer idle. Please try again.");
+          if (pi.getThinkingLevel() !== selection.thinkingLevel || ctx.model?.id !== selection.model.id ||
+              ctx.model?.provider !== selection.model.provider ||
+              JSON.stringify(pi.getActiveTools()) !== JSON.stringify(selection.activeTools)) {
+            throw new Error("Model or tool settings changed. Please try again.");
+          }
+        };
+        let plan: PrunePlan;
+        let compacted = false;
+        try {
+          plan = planPrune(ctx.sessionManager);
+        } catch (error) {
+          if (!(error instanceof CompactionRequiredError)) throw error;
+          const before = {
+            sourceId: ctx.sessionManager.getSessionId(), sourceFile: ctx.sessionManager.getSessionFile()!,
+            sourceLeaf: ctx.sessionManager.getLeafId(), sourceCount: ctx.sessionManager.getEntries().length,
+            contextHash: contextHash(ctx.sessionManager.buildSessionProjection().messages),
+          };
+          if (!await ctx.ui.confirm("Compact and prune?",
+            "Compact first (model call; may incur costs), then prune.\nOriginal archive kept (/resume).")) return;
+          assertReady();
+          assertUnchanged(ctx.sessionManager, before);
+          ctx.ui.notify("Compacting before pruning...", "info");
+          await new Promise<void>((resolve, reject) => {
+            ctx.compact({ onComplete: () => resolve(), onError: reject });
+          });
+          assertReady();
+          plan = planPrune(ctx.sessionManager);
+          if (plan.sourceId !== before.sourceId || plan.sourceFile !== before.sourceFile ||
+              !ctx.sessionManager.getBranch().some((entry) => entry.id === before.sourceLeaf)) {
+            throw new Error("Session or branch changed during compaction. Pruning stopped.");
+          }
+          compacted = true;
         }
+        if (!compacted && !await ctx.ui.confirm("Prune session?",
+          "Continue with the same context in a smaller session?\nOriginal archive kept (/resume).")) return;
+        assertReady();
+        assertUnchanged(ctx.sessionManager, plan);
         prepared = createPrunedSession(plan, selection);
         assertUnchanged(ctx.sessionManager, plan);
         switching = true;
@@ -72,7 +98,7 @@ export default function pruneExtension(pi: ExtensionAPI) {
         if (prepared && !switching) unlinkSync(prepared);
         const message = error instanceof Error ? error.message : "Prune failed.";
         try { current.ui.notify(message, "error"); }
-        catch { console.error("Prune switch failed; the original archive and prepared copy are preserved."); }
+        catch { console.error("Prune stopped after a session change; no session archive was deleted."); }
       } finally {
         running = false;
       }

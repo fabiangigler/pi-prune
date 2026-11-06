@@ -191,6 +191,9 @@ function commandHarness(sm: SessionManager) {
   let start: ((event: unknown, ctx: ExtensionContext) => unknown) | undefined;
   let active = [...selection.activeTools];
   const notices: Array<{ text: string; type: string }> = [];
+  const confirmations: Array<{ title: string; message: string }> = [];
+  let compaction: Parameters<ExtensionContext["compact"]>[0];
+  let compactionCalls = 0;
   const settings = { confirm: true, idle: true, pending: false, hasUI: true, cancelSwitch: false, throwSwitch: false,
     duringConfirm: () => {}, startupChange: () => {} };
   const api = {
@@ -203,11 +206,14 @@ function commandHarness(sm: SessionManager) {
   pruneExtension(api);
   let stale = false;
   let switched: SessionManager | undefined;
-  const ui = { confirm: async () => { settings.duringConfirm(); return settings.confirm; },
+  const ui = { confirm: async (title: string, message: string) => {
+      confirmations.push({ title, message }); settings.duringConfirm(); return settings.confirm;
+    },
     notify: (text: string, type: string) => { notices.push({ text, type }); } };
   const raw = {
     sessionManager: sm, hasUI: settings.hasUI, model: selection.model, thinkingLevel: selection.thinkingLevel,
     isIdle: () => settings.idle, hasPendingMessages: () => settings.pending, ui,
+    compact: (options: Parameters<ExtensionContext["compact"]>[0]) => { compactionCalls++; compaction = options; },
     switchSession: async (path: string, options: Parameters<ExtensionCommandContext["switchSession"]>[1]) => {
       if (settings.throwSwitch) throw new Error("Simulated switch failure");
       if (settings.cancelSwitch) return { cancelled: true };
@@ -230,7 +236,8 @@ function commandHarness(sm: SessionManager) {
     if (property === "hasUI") return settings.hasUI;
     return Reflect.get(target, property, receiver);
   } }) as unknown as ExtensionCommandContext;
-  return { settings, notices, run: (args = "") => handler!(args, ctx), switched: () => switched };
+  return { settings, notices, confirmations, compaction: () => compaction, compactionCalls: () => compactionCalls,
+    run: (args = "") => handler!(args, ctx), switched: () => switched };
 }
 
 test("command switches only after confirmation and validation, and does not reuse stale contexts", async () => {
@@ -240,6 +247,9 @@ test("command switches only after confirmation and validation, and does not reus
     const h = commandHarness(f.sm);
     await h.run();
     assert.ok(h.switched());
+    assert.equal(h.compactionCalls(), 0);
+    assert.deepEqual(h.confirmations, [{ title: "Prune session?",
+      message: "Continue with the same context in a smaller session?\nOriginal archive kept (/resume)." }]);
     assert.deepEqual(readFileSync(f.sm.getSessionFile()!), original);
     assert.deepEqual(h.switched()!.buildSessionProjection().messages, f.sm.buildSessionProjection().messages);
     assert.equal(h.notices.at(-1)?.type, "info");
@@ -341,4 +351,137 @@ test("does not create another session when all remaining records are required", 
     assert.throws(() => planPrune(next), /Nothing to prune/);
     assert.deepEqual(readdirSync(next.getSessionDir()), files);
   } finally { f.cleanup(); }
+});
+
+function uncompactedFixture() {
+  const f = fixture();
+  // Other branches have compactions, but this active branch has never been compacted.
+  f.sm.branch(f.stateResult);
+  const kept = f.sm.appendMessage({ role: "user", content: "Current question", timestamp: 20 });
+  return { ...f, kept };
+}
+
+function completeCompaction(sm: SessionManager, kept: string, h: ReturnType<typeof commandHarness>) {
+  sm.appendCompaction("New summary", kept, 90000);
+  h.compaction()!.onComplete!({ summary: "New summary", firstKeptEntryId: kept, tokensBefore: 90000, estimatedTokensAfter: 1000 });
+}
+
+test("uncompacted branch waits for successful compaction, then prunes with one informed confirmation", async () => {
+  const f = uncompactedFixture();
+  try {
+    const h = commandHarness(f.sm);
+    const archive = readFileSync(f.sm.getSessionFile()!);
+    const files = readdirSync(f.sm.getSessionDir());
+    const run = h.run();
+    await Promise.resolve();
+    assert.equal(h.compactionCalls(), 1);
+    assert.equal(h.switched(), undefined);
+    assert.deepEqual(readdirSync(f.sm.getSessionDir()), files);
+    assert.deepEqual(readFileSync(f.sm.getSessionFile()!), archive);
+    assert.deepEqual(h.confirmations, [{ title: "Compact and prune?",
+      message: "Compact first (model call; may incur costs), then prune.\nOriginal archive kept (/resume)." }]);
+    completeCompaction(f.sm, f.kept, h);
+    const compactedArchive = readFileSync(f.sm.getSessionFile()!);
+    const expected = f.sm.buildSessionProjection().messages;
+    await run;
+    assert.ok(h.switched());
+    assert.equal(h.confirmations.length, 1);
+    assert.equal(h.compactionCalls(), 1);
+    assert.deepEqual(h.switched()!.buildSessionProjection().messages, expected);
+    assert.deepEqual(readFileSync(f.sm.getSessionFile()!), compactedArchive);
+    assert.deepEqual(compactedArchive.subarray(0, archive.length), archive);
+  } finally { f.cleanup(); }
+});
+
+test("compaction failure, cancellation and too-small sessions never create or switch a continuation", async () => {
+  for (const error of ["Provider failed", "Compaction cancelled", "Nothing to compact (session too small)"]) {
+    const f = uncompactedFixture();
+    try {
+      const h = commandHarness(f.sm);
+      const files = readdirSync(f.sm.getSessionDir());
+      const archive = readFileSync(f.sm.getSessionFile()!);
+      const run = h.run();
+      await Promise.resolve();
+      assert.equal(h.compactionCalls(), 1);
+      h.compaction()!.onError!(new Error(error));
+      await run;
+      assert.equal(h.switched(), undefined);
+      assert.deepEqual(readdirSync(f.sm.getSessionDir()), files);
+      assert.deepEqual(readFileSync(f.sm.getSessionFile()!), archive);
+      assert.equal(h.notices.at(-1)?.text, error);
+    } finally { f.cleanup(); }
+  }
+});
+
+test("declined or changed uncompacted sessions do not start compaction", async () => {
+  for (const scenario of ["declined", "changed", "busy", "pending"] as const) {
+    const f = uncompactedFixture();
+    try {
+      const h = commandHarness(f.sm);
+      if (scenario === "declined") h.settings.confirm = false;
+      if (scenario === "changed") h.settings.duringConfirm = () => { f.sm.appendCustomEntry("example.state", 1); };
+      if (scenario === "busy") h.settings.duringConfirm = () => { h.settings.idle = false; };
+      if (scenario === "pending") h.settings.duringConfirm = () => { h.settings.pending = true; };
+      await h.run();
+      assert.equal(h.compactionCalls(), 0, scenario);
+      assert.equal(h.switched(), undefined, scenario);
+    } finally { f.cleanup(); }
+  }
+});
+
+test("successful callback without a saved compaction is not sufficient to prune", async () => {
+  const f = uncompactedFixture();
+  try {
+    const h = commandHarness(f.sm);
+    const run = h.run();
+    await Promise.resolve();
+    h.compaction()!.onComplete!({ summary: "Not saved", firstKeptEntryId: f.kept, tokensBefore: 90000, estimatedTokensAfter: 1000 });
+    await run;
+    assert.equal(h.switched(), undefined);
+    assert.equal(h.compactionCalls(), 1);
+    assert.equal(h.notices.at(-1)?.type, "error");
+  } finally { f.cleanup(); }
+});
+
+test("queued work, busy state or branch movement after compaction stops pruning", async () => {
+  for (const scenario of ["pending", "busy", "branch"] as const) {
+    const f = uncompactedFixture();
+    try {
+      const h = commandHarness(f.sm);
+      const files = readdirSync(f.sm.getSessionDir());
+      const run = h.run();
+      await Promise.resolve();
+      completeCompaction(f.sm, f.kept, h);
+      if (scenario === "pending") h.settings.pending = true;
+      if (scenario === "busy") h.settings.idle = false;
+      if (scenario === "branch") f.sm.branch(f.compact);
+      await run;
+      assert.equal(h.switched(), undefined, scenario);
+      assert.deepEqual(readdirSync(f.sm.getSessionDir()), files, scenario);
+      assert.equal(h.notices.at(-1)?.type, "error", scenario);
+    } finally { f.cleanup(); }
+  }
+});
+
+test("repeated /prune while waiting for compaction does not start a second compaction", async () => {
+  const f = uncompactedFixture();
+  try {
+    const h = commandHarness(f.sm);
+    const run = h.run();
+    await Promise.resolve();
+    await h.run();
+    assert.equal(h.compactionCalls(), 1);
+    completeCompaction(f.sm, f.kept, h);
+    await run;
+    assert.ok(h.switched());
+  } finally { f.cleanup(); }
+});
+
+test("ephemeral sessions fail preflight before any confirmation or compaction", async () => {
+  const h = commandHarness(SessionManager.inMemory());
+  await h.run();
+  assert.equal(h.confirmations.length, 0);
+  assert.equal(h.compactionCalls(), 0);
+  assert.equal(h.switched(), undefined);
+  assert.match(h.notices.at(-1)!.text, /saved session/);
 });

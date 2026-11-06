@@ -10,7 +10,8 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { contextHash } from "../prune.ts";
 
-test("real Pi loader and runtime restore the verified session without a provider request", async () => {
+for (const scenario of ["existing", "automatic", "cancelled", "aborted", "too-small"] as const) {
+test(`real Pi loader and runtime: ${scenario} compaction, no provider request`, { timeout: 10000 }, async () => {
   const directory = mkdtempSync(join(tmpdir(), "pi-prune-runtime-"));
   const cwd = join(directory, "project");
   const agentDir = join(directory, "agent");
@@ -36,22 +37,42 @@ test("real Pi loader and runtime restore the verified session without a provider
     sm.appendThinkingLevelChange("high");
     sm.appendMessage({ role: "system", content: "Initial instructions", timestamp: 1,
       toolsAdded: [{ name: "read", description: "Read", parameters: { type: "object" } }] });
-    sm.appendMessage({ role: "user", content: "Old text ".repeat(10000), timestamp: 2 });
+    if (scenario !== "too-small") sm.appendMessage({ role: "user", content: "Old text ".repeat(10000), timestamp: 2 });
     const kept = sm.appendMessage({ role: "user", content: "Current question", timestamp: 3 });
-    sm.appendCompaction("Existing summary", kept, 90000, { readFiles: ["file.ts"] });
+    if (scenario === "existing") sm.appendCompaction("Existing summary", kept, 90000, { readFiles: ["file.ts"] });
     sm.appendCustomEntry("example.store", { set: { a: 1 } });
     sm.appendCustomEntry("example.store", { set: { b: 2 } });
-    const before = contextHash(sm.buildSessionProjection().messages);
+    let before = contextHash(sm.buildSessionProjection().messages);
     const sourceFile = sm.getSessionFile()!;
-    const archive = readFileSync(sourceFile);
+    let archive = readFileSync(sourceFile);
+    const originalArchive = archive;
+    let compactions = 0;
+    let confirmations = 0;
+    let started!: () => void;
+    const compactionStarted = new Promise<void>((resolve) => { started = resolve; });
     const notices: Array<{ text: string; type: string }> = [];
     const errors: unknown[] = [];
-    const settingsManager = SettingsManager.inMemory({ defaultProvider: "example", defaultModel: "reasoner", defaultThinkingLevel: "high" });
+    const settingsManager = SettingsManager.inMemory({ defaultProvider: "example", defaultModel: "reasoner", defaultThinkingLevel: "high",
+      compaction: { keepRecentTokens: scenario === "too-small" ? 20000 : 0 } });
     const factory: CreateAgentSessionRuntimeFactory = async ({ sessionManager, sessionStartEvent }) => {
       const services = await createAgentSessionServices({
         cwd, agentDir, settingsManager, modelRuntime: models,
         resourceLoaderOptions: { noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true,
-          noContextFiles: true, additionalExtensionPaths: [plugin] },
+          noContextFiles: true, additionalExtensionPaths: [plugin], extensionFactories: [(pi) => {
+            pi.on("session_before_compact", async (event) => {
+              compactions++;
+              if (scenario === "cancelled") return { cancel: true };
+              if (scenario === "aborted") {
+                started();
+                await new Promise<void>((resolve) => event.signal.addEventListener("abort", () => resolve(), { once: true }));
+              } else assert.equal(scenario, "automatic", "Existing compactions must never be repeated");
+              return { compaction: { summary: "Synthetic summary", firstKeptEntryId: kept, tokensBefore: 90000 } };
+            });
+            pi.on("session_compact", (_event, ctx) => {
+              before = contextHash(ctx.sessionManager.buildSessionProjection().messages);
+              archive = readFileSync(sourceFile);
+            });
+          }] },
       });
       const result = await createAgentSessionFromServices({ services, sessionManager, sessionStartEvent });
       return { ...result, services, diagnostics: services.diagnostics };
@@ -61,7 +82,7 @@ test("real Pi loader and runtime restore the verified session without a provider
     const bind = async () => host.session.bindExtensions({
       mode: "rpc",
       uiContext: {
-        confirm: async () => true,
+        confirm: async () => { confirmations++; return true; },
         notify: (text: string, type: string) => { notices.push({ text, type }); },
       } as unknown as ExtensionUIContext,
       commandContextActions: {
@@ -77,7 +98,24 @@ test("real Pi loader and runtime restore the verified session without a provider
     host.setRebindSession(bind);
     await bind();
     assert.equal(host.services.resourceLoader.getExtensions().errors.length, 0);
-    await host.session.prompt("/prune");
+    const run = host.session.prompt("/prune");
+    if (scenario === "aborted") {
+      await compactionStarted;
+      host.session.abortCompaction();
+    }
+    await run;
+    assert.equal(confirmations, 1);
+    if (scenario === "cancelled" || scenario === "aborted" || scenario === "too-small") {
+      assert.equal(host.session.sessionFile, sourceFile);
+      assert.deepEqual(readFileSync(sourceFile), originalArchive);
+      assert.equal(notices.at(-1)?.type, "error", JSON.stringify(notices));
+      assert.match(notices.at(-1)!.text, scenario === "too-small" ? /too small/i : /cancelled/i);
+      assert.equal(compactions, scenario === "too-small" ? 0 : 1);
+      assert.deepEqual(errors, []);
+      return;
+    }
+    assert.equal(compactions, scenario === "automatic" ? 1 : 0);
+    assert.deepEqual(archive.subarray(0, originalArchive.length), originalArchive);
     assert.notEqual(host.session.sessionFile, sourceFile, JSON.stringify(notices));
     assert.equal(contextHash(host.session.sessionManager.buildSessionProjection().messages), before);
     assert.deepEqual(host.session.getActiveToolNames(), ["read"]);
@@ -98,3 +136,4 @@ test("real Pi loader and runtime restore the verified session without a provider
     rmSync(directory, { recursive: true, force: true });
   }
 });
+}
