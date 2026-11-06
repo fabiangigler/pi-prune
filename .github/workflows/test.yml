@@ -1,0 +1,22 @@
+name: Test
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        pi: ["1.4.0", "1.5.0"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: "12.11.2"
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - run: pnpm add -D @earendil-works/pi-coding-agent@${{ matrix.pi }} --ignore-scripts
+      - run: pnpm check
+      - run: pnpm test
